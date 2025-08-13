@@ -24,7 +24,7 @@ Add FSWatcher to your project through Xcode or by adding it to your `Package.swi
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/yourorg/FSWatcher.git", from: "1.0.0")
+    .package(url: "https://github.com/okooo5km/FSWatcher.git", from: "1.0.0")
 ]
 ```
 

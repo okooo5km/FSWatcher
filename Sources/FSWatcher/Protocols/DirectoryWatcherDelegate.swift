@@ -2,7 +2,7 @@
 //  DirectoryWatcherDelegate.swift
 //  FSWatcher
 //
-//  Created by FSWatcher on 2025/08/13.
+//  Created by okooo5km(十里) on 2025/08/13.
 //
 
 import Foundation

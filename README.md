@@ -1,3 +1,15 @@
+Using my apps is also a way to [support me](https://5km.tech):
+
+<p align="center">
+  <a href="https://zipic.app"><img src="https://5km.tech/products/zipic/icon.png" width="60" height="60" alt="Zipic" style="border-radius: 12px; margin: 4px;"></a>
+  <a href="https://orchard.5km.tech"><img src="https://5km.tech/products/orchard/icon.png" width="60" height="60" alt="Orchard" style="border-radius: 12px; margin: 4px;"></a>
+  <a href="https://apps.apple.com/cn/app/timego-clock/id6448658165?l=en-GB&mt=12"><img src="https://5km.tech/products/timego/icon.png" width="60" height="60" alt="TimeGo Clock" style="border-radius: 12px; margin: 4px;"></a>
+  <a href="https://keygengo.5km.tech"><img src="https://5km.tech/products/keygengo/icon.png" width="60" height="60" alt="KeygenGo" style="border-radius: 12px; margin: 4px;"></a>
+  <a href="https://hipixel.5km.tech"><img src="https://5km.tech/products/hipixel/icon.png" width="60" height="60" alt="HiPixel" style="border-radius: 12px; margin: 4px;"></a>
+</p>
+
+---
+
 # FSWatcher
 
 ![Swift](https://img.shields.io/badge/swift-5.9-orange.svg)

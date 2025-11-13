@@ -98,6 +98,42 @@ public struct RecursiveWatchOptions {
 }
 ```
 
+### MultiRecursiveDirectoryWatcher
+
+Manages recursive monitoring of multiple directories simultaneously.
+
+#### MultiRecursiveDirectoryWatcher - Initialization
+
+```swift
+public init(options: RecursiveWatchOptions = RecursiveWatchOptions(), configuration: DirectoryWatcher.Configuration = DirectoryWatcher.Configuration())
+```
+
+#### MultiRecursiveDirectoryWatcher - Methods
+
+```swift
+public func startWatching(directories: [URL])
+public func startWatching(directory: URL)
+public func stopWatching(directory: URL)
+public func stopAllWatching()
+public func isWatching(directory: URL) -> Bool
+
+// Filter management
+public func addFilter(_ filter: FileFilter)
+public func addFilter(_ filter: FileFilter, to directory: URL)
+public func clearAllFilters()
+
+// Ignore list management
+public func addIgnoredFiles(_ urls: [URL])
+public func addIgnoredFiles(_ urls: [URL], in directory: URL)
+public func addPredictiveIgnore(_ urls: [URL])
+public func addPredictiveIgnore(_ urls: [URL], in directory: URL)
+
+// Properties
+public var watchedDirectories: [URL] { get }
+public var allWatchedDirectories: [URL] { get }
+public var isWatching: Bool { get }
+```
+
 ## Configuration
 
 ### DirectoryWatcher.Configuration

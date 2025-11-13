@@ -98,6 +98,25 @@ let recursiveWatcher = try RecursiveDirectoryWatcher(
 )
 ```
 
+### Multiple Recursive Directories
+
+```swift
+var options = RecursiveWatchOptions()
+options.maxDepth = 3
+options.excludePatterns = [".git", "node_modules", "*.tmp"]
+
+let multiRecursiveWatcher = MultiRecursiveDirectoryWatcher(options: options)
+multiRecursiveWatcher.onDirectoryChange = { url in
+    print("Change detected: \\(url.path)")
+}
+
+multiRecursiveWatcher.startWatching(directories: [
+    projectURL1,
+    projectURL2,
+    projectURL3
+])
+```
+
 ## Advanced Features
 
 ### Smart Filtering System

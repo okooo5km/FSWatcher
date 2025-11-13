@@ -131,6 +131,52 @@ func recursiveWatchingExample() {
     }
 }
 
+// MARK: - Multiple Recursive Directories
+
+func multiRecursiveWatchingExample() {
+    // Configure recursive options
+    var options = RecursiveWatchOptions()
+    options.maxDepth = 3
+    options.excludePatterns = [".git", "node_modules", "*.tmp", ".DS_Store"]
+    options.followSymlinks = false
+    
+    let multiRecursiveWatcher = MultiRecursiveDirectoryWatcher(options: options)
+    
+    multiRecursiveWatcher.onDirectoryChange = { url in
+        print("Change detected: \(url.path)")
+    }
+    
+    multiRecursiveWatcher.onFilteredChange = { files in
+        print("Filtered files changed:")
+        for file in files {
+            print("  - \(file.path)")
+        }
+    }
+    
+    multiRecursiveWatcher.onError = { error in
+        print("Error: \(error)")
+    }
+    
+    // Watch multiple project directories recursively
+    let projectDirectories = [
+        URL(fileURLWithPath: "/Users/username/Project1"),
+        URL(fileURLWithPath: "/Users/username/Project2"),
+        URL(fileURLWithPath: "/Users/username/Project3")
+    ]
+    
+    multiRecursiveWatcher.startWatching(directories: projectDirectories)
+    
+    print("Recursively watching \(projectDirectories.count) directories:")
+    for dir in projectDirectories {
+        print("  - \(dir.path)")
+    }
+    
+    // Add filter for all watchers
+    multiRecursiveWatcher.addFilter(.fileExtensions(["swift", "js", "ts"]))
+    
+    RunLoop.main.run()
+}
+
 // MARK: - Using with Combine
 
 import Combine
@@ -230,10 +276,11 @@ print("1. Basic watching")
 print("2. Filtered watching")
 print("3. Multi-directory watching")
 print("4. Recursive watching")
-print("5. Combine integration")
-print("6. Swift Concurrency")
-print("7. Delegate pattern")
-print("\nSelect an example (1-7):")
+print("5. Multi-recursive watching")
+print("6. Combine integration")
+print("7. Swift Concurrency")
+print("8. Delegate pattern")
+print("\nSelect an example (1-8):")
 
 if let input = readLine(), let choice = Int(input) {
     switch choice {
@@ -246,8 +293,10 @@ if let input = readLine(), let choice = Int(input) {
     case 4:
         recursiveWatchingExample()
     case 5:
-        combineExample()
+        multiRecursiveWatchingExample()
     case 6:
+        combineExample()
+    case 7:
         if #available(macOS 10.15, iOS 13.0, *) {
             Task {
                 await asyncExample()
@@ -256,7 +305,7 @@ if let input = readLine(), let choice = Int(input) {
         } else {
             print("Swift Concurrency requires macOS 10.15+ or iOS 13.0+")
         }
-    case 7:
+    case 8:
         delegateExample()
     default:
         print("Invalid choice")

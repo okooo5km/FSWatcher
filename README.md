@@ -1,5 +1,8 @@
+# FSWatcher
+
 Using my apps is also a way to [support me](https://5km.tech):
 
+<!-- markdownlint-disable MD033 -->
 <p align="center">
   <a href="https://zipic.app"><img src="https://5km.tech/products/zipic/icon.png" width="60" height="60" alt="Zipic" style="border-radius: 12px; margin: 4px;"></a>
   <a href="https://orchard.5km.tech"><img src="https://5km.tech/products/orchard/icon.png" width="60" height="60" alt="Orchard" style="border-radius: 12px; margin: 4px;"></a>
@@ -7,10 +10,9 @@ Using my apps is also a way to [support me](https://5km.tech):
   <a href="https://keygengo.5km.tech"><img src="https://5km.tech/products/keygengo/icon.png" width="60" height="60" alt="KeygenGo" style="border-radius: 12px; margin: 4px;"></a>
   <a href="https://hipixel.5km.tech"><img src="https://5km.tech/products/hipixel/icon.png" width="60" height="60" alt="HiPixel" style="border-radius: 12px; margin: 4px;"></a>
 </p>
+<!-- markdownlint-enable MD033 -->
 
 ---
-
-# FSWatcher
 
 ![Swift](https://img.shields.io/badge/swift-5.9-orange.svg)
 ![Platform](https://img.shields.io/badge/platforms-macOS%20%7C%20iOS-lightgrey.svg)

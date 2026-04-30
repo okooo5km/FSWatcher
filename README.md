@@ -25,8 +25,9 @@ A high-performance, Swift-native file system watcher for macOS and iOS that prov
 ✨ **Event-Driven Architecture** - Uses `DispatchSource` for efficient file system monitoring  
 🎯 **Smart Filtering** - Advanced filter chains with support for file types, sizes, and patterns  
 🔍 **Predictive Ignoring** - Avoid monitoring self-generated files  
-📁 **Recursive Monitoring** - Watch entire directory trees with configurable depth  
+📁 **Recursive Monitoring** - Watch entire directory trees with configurable depth and FD-safe ceilings  
 ⚡ **Modern Swift** - Full support for Combine, Swift Concurrency, and structured concurrency  
+🔄 **Safe Recursive Scan** - Iterative stack-based scan prevents call-stack overflow on deep trees  
 🛡️ **Thread-Safe** - Designed for concurrent use across multiple threads  
 📊 **Low Resource Usage** - Minimal CPU and memory footprint  
 
@@ -38,7 +39,7 @@ Add FSWatcher to your project through Xcode or by adding it to your `Package.swi
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/okooo5km/FSWatcher.git", branch: "main")
+    .package(url: "https://github.com/okooo5km/FSWatcher.git", from: "0.1.0")
 ]
 ```
 
@@ -93,11 +94,15 @@ multiWatcher.startWatching(directories: [documentsURL, downloadsURL])
 var options = RecursiveWatchOptions()
 options.maxDepth = 5
 options.excludePatterns = ["node_modules", ".git", "*.tmp"]
+options.maxWatchedDirectories = 256  // FD ceiling (default: 256)
 
 let recursiveWatcher = try RecursiveDirectoryWatcher(
-    url: projectURL, 
+    url: projectURL,
     options: options
 )
+
+// Safe to call from the main thread — scan runs on a background queue
+recursiveWatcher.start(on: .global(qos: .utility))
 ```
 
 ### Multiple Recursive Directories
@@ -173,9 +178,10 @@ watcher.directoryChangePublisher
 ### Swift Concurrency
 
 ```swift
-watcher.start()
+// Async start — returns once the initial recursive scan completes
+await recursiveWatcher.startAsync()
 
-for await url in watcher.directoryChanges {
+for await url in recursiveWatcher.directoryChanges {
     await processChange(at: url)
 }
 ```
@@ -217,6 +223,10 @@ watcher.onError = { error in
         print("Permission denied: \\(url.path)")
     case .directoryNotFound(let url):
         print("Not found: \\(url.path)")
+    case .tooManyWatchers(let limit):
+        print("Watcher ceiling reached (\\(limit)); deeper subdirectories are not being watched")
+    case .failedToWatch(let url, let underlying):
+        print("Failed to watch \\(url.path): \\(underlying.localizedDescription)")
     default:
         print("Error: \\(error)")
     }

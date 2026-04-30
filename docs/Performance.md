@@ -277,6 +277,28 @@ options.excludePatterns = [
 ]
 ```
 
+### FD Ceiling for Sandboxed Processes
+
+Each watched directory holds an `O_EVTONLY` file descriptor. On sandboxed
+macOS apps the per-process limit is low (~256). Use
+`maxWatchedDirectories` to cap the number of simultaneously watched
+directories and prevent FD exhaustion:
+
+```swift
+var options = RecursiveWatchOptions()
+options.maxDepth = 5
+options.maxWatchedDirectories = 200  // Leave headroom for the rest of the app
+
+let watcher = try RecursiveDirectoryWatcher(url: directoryURL, options: options)
+
+watcher.onError = { error in
+    if case .tooManyWatchers(let limit) = error {
+        // Log or report — deeper subdirectories are silently skipped
+        print("Hit watcher ceiling: \(limit)")
+    }
+}
+```
+
 ### Selective Monitoring
 
 Monitor only what you need:

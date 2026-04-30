@@ -95,9 +95,10 @@ Monitor a development project with intelligent exclusions:
 var options = RecursiveWatchOptions()
 options.maxDepth = 10
 options.followSymlinks = false
+options.maxWatchedDirectories = 256  // FD ceiling for sandboxed processes
 options.excludePatterns = [
     ".git",
-    "node_modules", 
+    "node_modules",
     "build",
     "*.xcworkspace",
     "DerivedData",
@@ -275,15 +276,23 @@ watcher.onError = { error in
     case .insufficientPermissions(let url):
         // Request permission or show user guidance
         requestFileSystemPermission(for: url)
-        
+
     case .directoryNotFound(let url):
         // Wait for directory to be created
         waitForDirectory(url)
-        
+
     case .cannotOpenDirectory(let url):
         // Check if directory is accessible
         verifyDirectoryAccess(url)
-        
+
+    case .tooManyWatchers(let limit):
+        // Hit FD ceiling — deeper subdirectories are not being watched
+        print("Watcher ceiling reached (\(limit)); consider reducing maxDepth or maxWatchedDirectories")
+
+    case .failedToWatch(let url, let underlying):
+        // Single directory failed to open during recursive scan
+        print("Failed to watch \(url.path): \(underlying.localizedDescription)")
+
     default:
         // Handle other errors
         print("Unhandled error: \(error)")
@@ -352,20 +361,30 @@ Modern async/await integration:
 
 ```swift
 actor FileProcessor {
-    private let watcher: DirectoryWatcher
+    private let watcher: RecursiveDirectoryWatcher
     private var isProcessing = false
-    
-    init(url: URL) throws {
-        self.watcher = try DirectoryWatcher(url: url)
+
+    init(url: URL, options: RecursiveWatchOptions = RecursiveWatchOptions()) throws {
+        self.watcher = try RecursiveDirectoryWatcher(url: url, options: options)
         startProcessing()
     }
-    
+
     private func startProcessing() {
         Task {
+            // Async start — scan runs on a background queue, returns when complete
+            await watcher.startAsync()
+
             for await url in watcher.directoryChanges {
                 await processDirectory(url)
             }
         }
+
+        Task {
+            for await files in watcher.filteredChanges {
+                await processFiles(files)
+            }
+        }
+    }
         
         Task {
             for await files in watcher.filteredChanges {

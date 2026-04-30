@@ -85,6 +85,22 @@ Monitors directories and their subdirectories recursively.
 public init(url: URL, options: RecursiveWatchOptions = RecursiveWatchOptions(), configuration: DirectoryWatcher.Configuration = DirectoryWatcher.Configuration()) throws
 ```
 
+#### RecursiveDirectoryWatcher - Methods
+
+```swift
+/// Synchronous start — blocks the calling thread during the recursive scan.
+public func start()
+
+/// Async start — scan runs on the given queue; safe to call from the main thread.
+public func start(on queue: DispatchQueue = .global(qos: .utility))
+
+/// async/await variant — returns once the initial scan has completed.
+public func startAsync(on queue: DispatchQueue = .global(qos: .utility)) async
+
+/// Stop watching all directories.
+public func stop()
+```
+
 #### RecursiveWatchOptions
 
 ```swift
@@ -92,9 +108,11 @@ public struct RecursiveWatchOptions {
     public var maxDepth: Int? = nil
     public var followSymlinks: Bool = false
     public var excludePatterns: [String] = []
-    
+    public var maxWatchedDirectories: Int = 256  // FD ceiling
+
     public init()
-    public init(maxDepth: Int? = nil, followSymlinks: Bool = false, excludePatterns: [String] = [])
+    public init(maxDepth: Int? = nil, followSymlinks: Bool = false,
+                excludePatterns: [String] = [], maxWatchedDirectories: Int = 256)
 }
 ```
 
@@ -311,7 +329,9 @@ public enum FSWatcherError: Error, LocalizedError {
     case directoryNotFound(URL)
     case systemResourcesUnavailable
     case invalidConfiguration(String)
-    
+    case tooManyWatchers(limit: Int)                       // FD ceiling reached
+    case failedToWatch(URL, underlying: Error)             // single directory open failure
+
     public var errorDescription: String? { get }
 }
 ```

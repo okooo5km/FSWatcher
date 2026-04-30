@@ -12,25 +12,40 @@ import Combine
 public struct RecursiveWatchOptions {
     /// Maximum depth to watch (nil for unlimited)
     public var maxDepth: Int?
-    
+
     /// Whether to follow symbolic links
     public var followSymlinks: Bool = false
-    
+
     /// Glob patterns to exclude (e.g., "*.tmp", "node_modules")
     public var excludePatterns: [String] = []
-    
+
+    /// Hard ceiling on the number of subdirectories the recursive watcher will
+    /// open at once. Each watched directory holds an `O_EVTONLY` file
+    /// descriptor; on sandboxed macOS apps the per-process FD limit is around
+    /// 256, so the default keeps headroom for the rest of the app.
+    /// When the ceiling is hit further subdirectories are silently skipped and
+    /// `onError(.tooManyWatchers(limit:))` is emitted once.
+    public var maxWatchedDirectories: Int = 256
+
     /// Initialize with default options
     public init() {}
-    
+
     /// Initialize with custom options
     /// - Parameters:
     ///   - maxDepth: Maximum depth to watch
     ///   - followSymlinks: Whether to follow symbolic links
     ///   - excludePatterns: Patterns to exclude
-    public init(maxDepth: Int? = nil, followSymlinks: Bool = false, excludePatterns: [String] = []) {
+    ///   - maxWatchedDirectories: Hard ceiling on simultaneously watched directories
+    public init(
+        maxDepth: Int? = nil,
+        followSymlinks: Bool = false,
+        excludePatterns: [String] = [],
+        maxWatchedDirectories: Int = 256
+    ) {
         self.maxDepth = maxDepth
         self.followSymlinks = followSymlinks
         self.excludePatterns = excludePatterns
+        self.maxWatchedDirectories = maxWatchedDirectories
     }
 }
 
@@ -44,6 +59,11 @@ public class RecursiveDirectoryWatcher {
     private var configuration: DirectoryWatcher.Configuration
     private var watchers: [URL: DirectoryWatcher] = [:]
     private let watchersLock = NSLock()
+
+    /// Set once when `maxWatchedDirectories` is hit, so the limit is reported
+    /// to `onError` exactly once per recursive scan instead of spamming.
+    private var tooManyWatchersReported = false
+    private let tooManyWatchersLock = NSLock()
     
     // Event handlers
     public weak var delegate: DirectoryWatcherDelegate?
@@ -90,10 +110,54 @@ public class RecursiveDirectoryWatcher {
     
     // MARK: - Public Methods
     
-    /// Start watching the directory recursively
+    /// Start watching the directory recursively (synchronous).
+    ///
+    /// On large or cloud-synced trees the initial scan can take seconds and
+    /// will block the calling thread. On the main thread that puts the app at
+    /// risk of the macOS launch watchdog. Prefer `start(on:)` for app-launch
+    /// paths.
     public func start() {
+        resetLimitReporting()
         // Scan and watch all directories
         scanAndWatchSubdirectories(at: rootURL, currentDepth: 0)
+    }
+
+    /// Start watching asynchronously on the given dispatch queue.
+    ///
+    /// The recursive scan and per-directory `open(O_EVTONLY)` calls run on
+    /// `queue` instead of the caller's thread, so this is safe to invoke from
+    /// the main thread during app launch. Event delivery still goes through
+    /// the queue configured on `DirectoryWatcher.Configuration`.
+    /// - Parameter queue: Background queue to perform the scan on. Defaults
+    ///   to a utility-priority global queue.
+    public func start(on queue: DispatchQueue = .global(qos: .utility)) {
+        resetLimitReporting()
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            self.scanAndWatchSubdirectories(at: self.rootURL, currentDepth: 0)
+        }
+    }
+
+    /// Async/await variant of `start(on:)`. Returns once the initial recursive
+    /// scan has completed.
+    public func startAsync(on queue: DispatchQueue = .global(qos: .utility)) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            resetLimitReporting()
+            queue.async { [weak self] in
+                guard let self = self else {
+                    continuation.resume()
+                    return
+                }
+                self.scanAndWatchSubdirectories(at: self.rootURL, currentDepth: 0)
+                continuation.resume()
+            }
+        }
+    }
+
+    private func resetLimitReporting() {
+        tooManyWatchersLock.lock()
+        tooManyWatchersReported = false
+        tooManyWatchersLock.unlock()
     }
     
     /// Stop watching all directories
@@ -222,95 +286,145 @@ public class RecursiveDirectoryWatcher {
     
     // MARK: - Private Methods
     
+    /// Iterative recursive scan. Uses an explicit stack instead of true
+    /// recursion so deep trees cannot blow the call stack, and so that hitting
+    /// the `maxWatchedDirectories` ceiling can short-circuit cleanly.
     private func scanAndWatchSubdirectories(at url: URL, currentDepth: Int) {
-        // Check depth limit
-        if let maxDepth = options.maxDepth, currentDepth > maxDepth {
-            return
-        }
-        
-        // Check if directory should be excluded
-        let directoryName = url.lastPathComponent
-        for pattern in options.excludePatterns {
-            if matchesGlobPattern(name: directoryName, pattern: pattern) {
+        var stack: [(URL, Int)] = [(url, currentDepth)]
+        while let (currentURL, depth) = stack.popLast() {
+            // Check depth limit
+            if let maxDepth = options.maxDepth, depth > maxDepth {
+                continue
+            }
+
+            // Check if directory should be excluded
+            let directoryName = currentURL.lastPathComponent
+            var excluded = false
+            for pattern in options.excludePatterns where matchesGlobPattern(name: directoryName, pattern: pattern) {
+                excluded = true
+                break
+            }
+            if excluded { continue }
+
+            // Try to start watching this directory. If we hit the FD ceiling,
+            // stop descending entirely — there is no point queueing more work
+            // we cannot service.
+            let outcome = watchDirectory(currentURL)
+            switch outcome {
+            case .limitReached:
                 return
+            case .alreadyWatching, .started, .failed:
+                break
             }
-        }
-        
-        // Create watcher for this directory
-        watchDirectory(url)
-        
-        // Scan subdirectories
-        do {
-            let contents = try FileManager.default.contentsOfDirectory(
-                at: url,
-                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-                options: [.skipsHiddenFiles]
-            )
-            
-            for item in contents {
-                var isDirectory: ObjCBool = false
-                var isSymlink = false
-                
-                // Check if it's a symbolic link
-                if let resourceValues = try? item.resourceValues(forKeys: [.isSymbolicLinkKey]),
-                   let isSymbolicLink = resourceValues.isSymbolicLink {
-                    isSymlink = isSymbolicLink
+
+            // Scan subdirectories
+            do {
+                let contents = try FileManager.default.contentsOfDirectory(
+                    at: currentURL,
+                    includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                    options: [.skipsHiddenFiles]
+                )
+
+                for item in contents {
+                    var isDirectory: ObjCBool = false
+                    var isSymlink = false
+
+                    // Check if it's a symbolic link
+                    if let resourceValues = try? item.resourceValues(forKeys: [.isSymbolicLinkKey]),
+                       let isSymbolicLink = resourceValues.isSymbolicLink {
+                        isSymlink = isSymbolicLink
+                    }
+
+                    // Skip symlinks if not following them
+                    if isSymlink && !options.followSymlinks {
+                        continue
+                    }
+
+                    // Check if it's a directory
+                    if FileManager.default.fileExists(atPath: item.path, isDirectory: &isDirectory),
+                       isDirectory.boolValue {
+                        stack.append((item, depth + 1))
+                    }
                 }
-                
-                // Skip symlinks if not following them
-                if isSymlink && !options.followSymlinks {
-                    continue
-                }
-                
-                // Check if it's a directory
-                if FileManager.default.fileExists(atPath: item.path, isDirectory: &isDirectory),
-                   isDirectory.boolValue {
-                    // Recursively watch subdirectory
-                    scanAndWatchSubdirectories(at: item, currentDepth: currentDepth + 1)
-                }
+            } catch {
+                // Ignore errors for individual directories
             }
-        } catch {
-            // Ignore errors for individual directories
         }
     }
-    
-    private func watchDirectory(_ url: URL) {
+
+    private enum WatchOutcome {
+        case alreadyWatching
+        case started
+        case limitReached
+        case failed
+    }
+
+    private func watchDirectory(_ url: URL) -> WatchOutcome {
         watchersLock.lock()
-        defer { watchersLock.unlock() }
-        
+
         // Check if already watching
-        guard watchers[url] == nil else { return }
-        
+        if watchers[url] != nil {
+            watchersLock.unlock()
+            return .alreadyWatching
+        }
+
+        // Enforce the configured ceiling on simultaneously watched
+        // directories. Each watcher holds an O_EVTONLY file descriptor; on a
+        // sandboxed app the per-process FD limit is small (~256) and a deep
+        // cloud-synced tree can blow past it, after which every subsequent
+        // open() fails. Stopping early is much friendlier than letting FDs
+        // exhaust silently.
+        if watchers.count >= options.maxWatchedDirectories {
+            let limit = options.maxWatchedDirectories
+            watchersLock.unlock()
+
+            tooManyWatchersLock.lock()
+            let alreadyReported = tooManyWatchersReported
+            tooManyWatchersReported = true
+            tooManyWatchersLock.unlock()
+
+            if !alreadyReported {
+                onError?(.tooManyWatchers(limit: limit))
+            }
+            return .limitReached
+        }
+
         do {
             let watcher = try DirectoryWatcher(url: url, configuration: configuration)
-            
+
             // Set up event forwarding
             watcher.onDirectoryChange = { [weak self] changedURL in
                 self?.handleDirectoryChange(changedURL)
-                
+
                 // Check for new subdirectories
                 self?.checkForNewSubdirectories(in: changedURL)
             }
-            
+
             watcher.onFilteredChange = { [weak self] filteredURLs in
                 self?.handleFilteredChange(filteredURLs)
             }
-            
+
             watcher.onError = { [weak self] error in
                 self?.onError?(error)
             }
-            
+
             // Start watching
             watcher.start()
-            
+
             // Store the watcher
             watchers[url] = watcher
-            
+            watchersLock.unlock()
+            return .started
         } catch {
-            // Handle error silently or report it
+            watchersLock.unlock()
+            // Surface the failure so callers can log/observe instead of
+            // having errors disappear into the void.
             if let fsError = error as? FSWatcherError {
                 onError?(fsError)
+            } else {
+                onError?(.failedToWatch(url, underlying: error))
             }
+            return .failed
         }
     }
     

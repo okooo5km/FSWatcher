@@ -254,6 +254,34 @@ class PooledProcessor {
 
 Optimize recursive monitoring for large directory trees.
 
+### Backend Selection
+
+`RecursiveWatchOptions` defaults to `.dispatchSource` for compatibility with
+FSWatcher 0.1.x. That backend opens one `O_EVTONLY` file descriptor per watched
+directory, which is precise and works on macOS/iOS, but it does not scale well to
+thousands of subdirectories.
+
+On macOS, large recursive trees should opt into the FSEvents backend:
+
+```swift
+let options = RecursiveWatchOptions(
+    maxDepth: 5,
+    backend: .fsevents
+)
+
+let watcher = try RecursiveDirectoryWatcher(url: directoryURL, options: options)
+watcher.start(on: .global(qos: .utility))
+```
+
+FSEvents watches the root hierarchy with one stream. It coalesces events and the
+watcher performs a bounded snapshot under the changed directory so deep files are
+still surfaced through `onFilteredChange`.
+
+Use `.automatic` if you want the library to select FSEvents on macOS and
+DispatchSource elsewhere. `.automatic` falls back to DispatchSource when
+`followSymlinks` is enabled because FSEvents does not follow symlinked
+directories as independent recursive roots.
+
 ### Depth Limiting
 
 ```swift
@@ -279,10 +307,10 @@ options.excludePatterns = [
 
 ### FD Ceiling for Sandboxed Processes
 
-Each watched directory holds an `O_EVTONLY` file descriptor. On sandboxed
-macOS apps the per-process limit is low (~256). Use
-`maxWatchedDirectories` to cap the number of simultaneously watched
-directories and prevent FD exhaustion:
+For the DispatchSource backend, each watched directory holds an `O_EVTONLY` file
+descriptor. On sandboxed macOS apps the per-process limit is low (~256). Use
+`maxWatchedDirectories` to cap the number of simultaneously watched directories
+and prevent FD exhaustion:
 
 ```swift
 var options = RecursiveWatchOptions()
@@ -297,6 +325,18 @@ watcher.onError = { error in
         print("Hit watcher ceiling: \(limit)")
     }
 }
+```
+
+`maxWatchedDirectories` does not apply to the FSEvents backend.
+
+### Stress Runner
+
+Use the Swift stress runner to compare backends:
+
+```bash
+swift run FSWatcherStress --dirs 1000 --files-per-dir 100 --backend fsevents --max-depth 2
+swift run FSWatcherStress --dirs 1000 --backend dispatch --max-watchers 256 --timeout 3
+swift run FSWatcherStress --dirs 1000 --backend dispatch --max-watchers 2048
 ```
 
 ### Selective Monitoring

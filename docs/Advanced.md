@@ -96,6 +96,7 @@ var options = RecursiveWatchOptions()
 options.maxDepth = 10
 options.followSymlinks = false
 options.maxWatchedDirectories = 256  // FD ceiling for sandboxed processes
+options.backend = .dispatchSource
 options.excludePatterns = [
     ".git",
     "node_modules",
@@ -117,6 +118,26 @@ projectWatcher.addFilter(
         .and(.fileSize(1...))  // Ignore empty files
 )
 ```
+
+### Large macOS Asset Trees
+
+Use the FSEvents backend for large photo, asset, or cloud-synced directory
+trees on macOS:
+
+```swift
+let options = RecursiveWatchOptions(
+    maxDepth: 3,
+    excludePatterns: [".git", ".build", "node_modules"],
+    backend: .fsevents
+)
+
+let assetWatcher = try RecursiveDirectoryWatcher(url: assetRoot, options: options)
+assetWatcher.addFilter(.fileExtensions(["jpg", "jpeg", "png", "webp", "heic"]))
+assetWatcher.start(on: .global(qos: .utility))
+```
+
+This backend uses one root FSEvent stream and does not consume one file
+descriptor per subdirectory. `watchedDirectories` returns the watched root URL.
 
 ### Content Management System
 

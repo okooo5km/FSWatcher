@@ -104,17 +104,36 @@ public func stop()
 #### RecursiveWatchOptions
 
 ```swift
+public enum RecursiveWatchBackend {
+    case automatic
+    case dispatchSource
+    case fsevents
+}
+
 public struct RecursiveWatchOptions {
     public var maxDepth: Int? = nil
     public var followSymlinks: Bool = false
     public var excludePatterns: [String] = []
     public var maxWatchedDirectories: Int = 256  // FD ceiling
+    public var backend: RecursiveWatchBackend = .dispatchSource
 
     public init()
     public init(maxDepth: Int? = nil, followSymlinks: Bool = false,
                 excludePatterns: [String] = [], maxWatchedDirectories: Int = 256)
+    public init(maxDepth: Int? = nil, followSymlinks: Bool = false,
+                excludePatterns: [String] = [], maxWatchedDirectories: Int = 256,
+                backend: RecursiveWatchBackend)
 }
 ```
+
+`backend` defaults to `.dispatchSource` to preserve FSWatcher 0.1.x behavior.
+Use `.fsevents` for large recursive macOS trees where a single FSEvent stream is
+preferable to one file descriptor per subdirectory. Use `.automatic` to select
+FSEvents on macOS unless `followSymlinks` is enabled; other platforms use
+DispatchSource.
+
+When FSEvents is active, `watchedDirectories` returns the watched root URL.
+`maxWatchedDirectories` applies only to the DispatchSource backend.
 
 ### MultiRecursiveDirectoryWatcher
 

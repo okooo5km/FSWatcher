@@ -7,7 +7,7 @@ let package = Package(
     name: "FSWatcher",
     platforms: [
         .macOS(.v12),
-        .iOS(.v15)
+        .iOS(.v15),
     ],
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
@@ -17,6 +17,9 @@ let package = Package(
         .executable(
             name: "FSWatcherExample",
             targets: ["FSWatcherExample"]),
+        .executable(
+            name: "FSWatcherStress",
+            targets: ["FSWatcherStress"]),
     ],
     dependencies: [
         // Dependencies declare other packages that this package depends on.
@@ -29,6 +32,9 @@ let package = Package(
             dependencies: []),
         .executableTarget(
             name: "FSWatcherExample",
+            dependencies: ["FSWatcher"]),
+        .executableTarget(
+            name: "FSWatcherStress",
             dependencies: ["FSWatcher"]),
         .testTarget(
             name: "FSWatcherTests",

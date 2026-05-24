@@ -22,10 +22,10 @@ A high-performance, Swift-native file system watcher for macOS and iOS that prov
 
 ## Features
 
-✨ **Event-Driven Architecture** - Uses `DispatchSource` for efficient file system monitoring  
+✨ **Event-Driven Architecture** - Uses `DispatchSource` and macOS FSEvents for efficient file system monitoring
 🎯 **Smart Filtering** - Advanced filter chains with support for file types, sizes, and patterns  
 🔍 **Predictive Ignoring** - Avoid monitoring self-generated files  
-📁 **Recursive Monitoring** - Watch entire directory trees with configurable depth and FD-safe ceilings  
+📁 **Recursive Monitoring** - Watch entire directory trees with configurable depth, FD-safe ceilings, or a one-stream macOS FSEvents backend
 ⚡ **Modern Swift** - Full support for Combine, Swift Concurrency, and structured concurrency  
 🔄 **Safe Recursive Scan** - Iterative stack-based scan prevents call-stack overflow on deep trees  
 🛡️ **Thread-Safe** - Designed for concurrent use across multiple threads  
@@ -39,7 +39,7 @@ Add FSWatcher to your project through Xcode or by adding it to your `Package.swi
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/okooo5km/FSWatcher.git", from: "0.1.0")
+    .package(url: "https://github.com/okooo5km/FSWatcher.git", from: "0.2.0")
 ]
 ```
 
@@ -95,6 +95,7 @@ var options = RecursiveWatchOptions()
 options.maxDepth = 5
 options.excludePatterns = ["node_modules", ".git", "*.tmp"]
 options.maxWatchedDirectories = 256  // FD ceiling (default: 256)
+options.backend = .dispatchSource      // Default; preserves FSWatcher 0.1.x behavior
 
 let recursiveWatcher = try RecursiveDirectoryWatcher(
     url: projectURL,
@@ -103,6 +104,43 @@ let recursiveWatcher = try RecursiveDirectoryWatcher(
 
 // Safe to call from the main thread — scan runs on a background queue
 recursiveWatcher.start(on: .global(qos: .utility))
+```
+
+### Large macOS Directory Trees
+
+For large recursive trees on macOS, opt into the FSEvents backend. It watches the
+root hierarchy with a single FSEvent stream instead of opening one file
+descriptor per subdirectory:
+
+```swift
+let options = RecursiveWatchOptions(
+    maxDepth: 5,
+    backend: .fsevents
+)
+
+let watcher = try RecursiveDirectoryWatcher(url: photosURL, options: options)
+watcher.onDirectoryChange = { changedDirectory in
+    print("Changed: \(changedDirectory.path)")
+}
+watcher.start()
+```
+
+`RecursiveWatchOptions()` still defaults to `.dispatchSource` for source
+compatibility. Use `.automatic` when you want FSWatcher to pick FSEvents on
+macOS and DispatchSource elsewhere. If `followSymlinks` is enabled, `.automatic`
+falls back to DispatchSource because FSEvents does not follow symlinked
+directories as independent recursive roots.
+
+When the FSEvents backend is active, `watchedDirectories` returns the watched
+root URL. `maxWatchedDirectories` only applies to the DispatchSource backend.
+
+### Stress Testing
+
+The package includes a Swift stress runner for large recursive trees:
+
+```bash
+swift run FSWatcherStress --dirs 1000 --files-per-dir 100 --backend fsevents --max-depth 2
+swift run FSWatcherStress --dirs 1000 --backend dispatch --max-watchers 256 --timeout 3
 ```
 
 ### Multiple Recursive Directories

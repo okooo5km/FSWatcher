@@ -127,8 +127,11 @@ final class MultiRecursiveDirectoryWatcherTests: XCTestCase {
         let expectation = XCTestExpectation(description: "Subdirectory change detected")
         
         var detectedURLs: Set<URL> = []
+        let detectedLock = NSLock()
         
         watcher.onDirectoryChange = { url in
+            detectedLock.lock()
+            defer { detectedLock.unlock() }
             detectedURLs.insert(url)
             // At least one change should be detected
             if detectedURLs.count >= 1 {
@@ -225,8 +228,11 @@ final class MultiRecursiveDirectoryWatcherTests: XCTestCase {
         let expectation = XCTestExpectation(description: "Changes detected in multiple directories")
         
         var detectedURLs: Set<URL> = []
+        let detectedLock = NSLock()
         
         watcher.onDirectoryChange = { url in
+            detectedLock.lock()
+            defer { detectedLock.unlock() }
             detectedURLs.insert(url)
             // At least 2 changes should be detected (from 2 different directories)
             if detectedURLs.count >= 2 {
@@ -248,7 +254,10 @@ final class MultiRecursiveDirectoryWatcherTests: XCTestCase {
         wait(for: [expectation], timeout: 5.0)
         
         // Verify at least 2 directories were detected
-        XCTAssertGreaterThanOrEqual(detectedURLs.count, 2, "Should detect changes from at least 2 directories")
+        detectedLock.lock()
+        let detectedCount = detectedURLs.count
+        detectedLock.unlock()
+        XCTAssertGreaterThanOrEqual(detectedCount, 2, "Should detect changes from at least 2 directories")
     }
     
     // MARK: - Filter Management Tests
@@ -400,9 +409,12 @@ final class MultiRecursiveDirectoryWatcherTests: XCTestCase {
         let expectation = XCTestExpectation(description: "Publisher emitted value")
         
         var receivedURLs: Set<URL> = []
+        let receivedLock = NSLock()
         
         watcher.directoryChangePublisher
             .sink { url in
+                receivedLock.lock()
+                defer { receivedLock.unlock() }
                 receivedURLs.insert(url)
                 if receivedURLs.count >= 1 {
                     expectation.fulfill()
@@ -606,4 +618,3 @@ final class MultiRecursiveDirectoryWatcherTests: XCTestCase {
         XCTAssertTrue(watcher.isWatching)
     }
 }
-

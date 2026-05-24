@@ -5,8 +5,34 @@
 //  Created by okooo5km(十里) on 2025/08/13.
 //
 
-import Foundation
 import Combine
+import Foundation
+
+#if os(macOS)
+    import CoreServices
+#endif
+
+/// Backend used by `RecursiveDirectoryWatcher`.
+public enum RecursiveWatchBackend: Equatable, Sendable {
+    /// Choose the lowest-resource backend for the current platform.
+    ///
+    /// On macOS this uses FSEvents unless `followSymlinks` is enabled. On
+    /// other platforms it falls back to the DispatchSource backend.
+    case automatic
+
+    /// Watch every directory with one `DispatchSourceFileSystemObject`.
+    ///
+    /// This preserves the original FSWatcher behavior and follows symlinked
+    /// directories when requested, but large trees consume one file descriptor
+    /// per watched directory.
+    case dispatchSource
+
+    /// Watch the root hierarchy with one macOS FSEvents stream.
+    ///
+    /// This backend is macOS-only and does not follow symlinked directories as
+    /// independent recursive roots.
+    case fsevents
+}
 
 /// Options for recursive directory watching
 public struct RecursiveWatchOptions {
@@ -27,6 +53,12 @@ public struct RecursiveWatchOptions {
     /// `onError(.tooManyWatchers(limit:))` is emitted once.
     public var maxWatchedDirectories: Int = 256
 
+    /// Recursive watching implementation.
+    ///
+    /// Defaults to `.dispatchSource` to preserve FSWatcher 0.1.x behavior.
+    /// Use `.fsevents` or `.automatic` for large macOS directory trees.
+    public var backend: RecursiveWatchBackend = .dispatchSource
+
     /// Initialize with default options
     public init() {}
 
@@ -36,6 +68,7 @@ public struct RecursiveWatchOptions {
     ///   - followSymlinks: Whether to follow symbolic links
     ///   - excludePatterns: Patterns to exclude
     ///   - maxWatchedDirectories: Hard ceiling on simultaneously watched directories
+    ///   - backend: Recursive watching implementation
     public init(
         maxDepth: Int? = nil,
         followSymlinks: Bool = false,
@@ -46,70 +79,104 @@ public struct RecursiveWatchOptions {
         self.followSymlinks = followSymlinks
         self.excludePatterns = excludePatterns
         self.maxWatchedDirectories = maxWatchedDirectories
+        self.backend = .dispatchSource
+    }
+
+    /// Initialize with custom options and backend selection.
+    /// - Parameters:
+    ///   - maxDepth: Maximum depth to watch
+    ///   - followSymlinks: Whether to follow symbolic links
+    ///   - excludePatterns: Patterns to exclude
+    ///   - maxWatchedDirectories: Hard ceiling on simultaneously watched directories
+    ///   - backend: Recursive watching implementation
+    public init(
+        maxDepth: Int? = nil,
+        followSymlinks: Bool = false,
+        excludePatterns: [String] = [],
+        maxWatchedDirectories: Int = 256,
+        backend: RecursiveWatchBackend
+    ) {
+        self.maxDepth = maxDepth
+        self.followSymlinks = followSymlinks
+        self.excludePatterns = excludePatterns
+        self.maxWatchedDirectories = maxWatchedDirectories
+        self.backend = backend
     }
 }
 
 /// A watcher that recursively monitors directories and their subdirectories
 public class RecursiveDirectoryWatcher {
-    
+
     // MARK: - Properties
-    
+
     private let rootURL: URL
     private let options: RecursiveWatchOptions
     private var configuration: DirectoryWatcher.Configuration
     private var watchers: [URL: DirectoryWatcher] = [:]
     private let watchersLock = NSLock()
 
+    #if os(macOS)
+        private var eventStream: FSEventStreamRef?
+        private var fseventsIsWatching = false
+        private let fseventsLock = NSLock()
+        private var fseventsPendingDirectories: Set<URL> = []
+        private var fseventsDebounceWorkItem: DispatchWorkItem?
+        private let fseventsPendingLock = NSLock()
+    #endif
+
     /// Set once when `maxWatchedDirectories` is hit, so the limit is reported
     /// to `onError` exactly once per recursive scan instead of spamming.
     private var tooManyWatchersReported = false
     private let tooManyWatchersLock = NSLock()
-    
+
     // Event handlers
     public weak var delegate: DirectoryWatcherDelegate?
     public var onDirectoryChange: ((URL) -> Void)?
     public var onFilteredChange: (([URL]) -> Void)?
     public var onError: ((FSWatcherError) -> Void)?
-    
+
     // Combine support
     private let directoryChangeSubject = PassthroughSubject<URL, Never>()
     private let filteredChangeSubject = PassthroughSubject<[URL], Never>()
-    
+
     // Swift Concurrency support
     private var continuations: [UUID: AsyncStream<URL>.Continuation] = [:]
     private var filteredContinuations: [UUID: AsyncStream<[URL]>.Continuation] = [:]
     private let continuationLock = NSLock()
-    
+
     // MARK: - Initialization
-    
+
     /// Initialize a recursive directory watcher
     /// - Parameters:
     ///   - url: The root directory to watch
     ///   - options: Options for recursive watching
     ///   - configuration: Configuration for individual watchers
     /// - Throws: FSWatcherError if initialization fails
-    public init(url: URL, options: RecursiveWatchOptions = RecursiveWatchOptions(), configuration: DirectoryWatcher.Configuration = DirectoryWatcher.Configuration()) throws {
+    public init(
+        url: URL, options: RecursiveWatchOptions = RecursiveWatchOptions(),
+        configuration: DirectoryWatcher.Configuration = DirectoryWatcher.Configuration()
+    ) throws {
         self.rootURL = url
         self.options = options
         self.configuration = configuration
-        
+
         // Verify the directory exists
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
             throw FSWatcherError.directoryNotFound(url)
         }
-        
+
         guard isDirectory.boolValue else {
             throw FSWatcherError.invalidConfiguration("URL is not a directory: \(url.path)")
         }
     }
-    
+
     deinit {
         stop()
     }
-    
+
     // MARK: - Public Methods
-    
+
     /// Start watching the directory recursively (synchronous).
     ///
     /// On large or cloud-synced trees the initial scan can take seconds and
@@ -118,8 +185,14 @@ public class RecursiveDirectoryWatcher {
     /// paths.
     public func start() {
         resetLimitReporting()
-        // Scan and watch all directories
-        scanAndWatchSubdirectories(at: rootURL, currentDepth: 0)
+        switch resolveBackendForStart() {
+        case .dispatchSource:
+            scanAndWatchSubdirectories(at: rootURL, currentDepth: 0)
+        case .fsevents:
+            startFSEvents()
+        case .automatic:
+            break
+        }
     }
 
     /// Start watching asynchronously on the given dispatch queue.
@@ -132,9 +205,17 @@ public class RecursiveDirectoryWatcher {
     ///   to a utility-priority global queue.
     public func start(on queue: DispatchQueue = .global(qos: .utility)) {
         resetLimitReporting()
+        let backend = resolveBackendForStart()
         queue.async { [weak self] in
             guard let self = self else { return }
-            self.scanAndWatchSubdirectories(at: self.rootURL, currentDepth: 0)
+            switch backend {
+            case .dispatchSource:
+                self.scanAndWatchSubdirectories(at: self.rootURL, currentDepth: 0)
+            case .fsevents:
+                self.startFSEvents()
+            case .automatic:
+                break
+            }
         }
     }
 
@@ -143,14 +224,43 @@ public class RecursiveDirectoryWatcher {
     public func startAsync(on queue: DispatchQueue = .global(qos: .utility)) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             resetLimitReporting()
+            let backend = resolveBackendForStart()
             queue.async { [weak self] in
                 guard let self = self else {
                     continuation.resume()
                     return
                 }
-                self.scanAndWatchSubdirectories(at: self.rootURL, currentDepth: 0)
+                switch backend {
+                case .dispatchSource:
+                    self.scanAndWatchSubdirectories(at: self.rootURL, currentDepth: 0)
+                case .fsevents:
+                    self.startFSEvents()
+                case .automatic:
+                    break
+                }
                 continuation.resume()
             }
+        }
+    }
+
+    private func resolveBackendForStart() -> RecursiveWatchBackend {
+        switch options.backend {
+        case .automatic:
+            #if os(macOS)
+                return options.followSymlinks ? .dispatchSource : .fsevents
+            #else
+                return .dispatchSource
+            #endif
+        case .dispatchSource:
+            return .dispatchSource
+        case .fsevents:
+            #if os(macOS)
+                return .fsevents
+            #else
+                onError?(
+                    .invalidConfiguration("FSEvents backend is only available on macOS; using DispatchSource instead."))
+                return .dispatchSource
+            #endif
         }
     }
 
@@ -159,18 +269,20 @@ public class RecursiveDirectoryWatcher {
         tooManyWatchersReported = false
         tooManyWatchersLock.unlock()
     }
-    
+
     /// Stop watching all directories
     public func stop() {
+        stopFSEvents()
+
         watchersLock.lock()
         let currentWatchers = watchers
         watchers.removeAll()
         watchersLock.unlock()
-        
+
         for (_, watcher) in currentWatchers {
             watcher.stop()
         }
-        
+
         // Complete all continuations
         continuationLock.lock()
         continuations.values.forEach { $0.finish() }
@@ -179,86 +291,104 @@ public class RecursiveDirectoryWatcher {
         filteredContinuations.removeAll()
         continuationLock.unlock()
     }
-    
+
     /// Check if the watcher is currently watching
     public var isWatching: Bool {
+        #if os(macOS)
+            fseventsLock.lock()
+            let isWatchingFSEvents = fseventsIsWatching
+            fseventsLock.unlock()
+            if isWatchingFSEvents {
+                return true
+            }
+        #endif
+
         watchersLock.lock()
         defer { watchersLock.unlock() }
         return !watchers.isEmpty && watchers.values.contains { $0.isWatching }
     }
-    
+
     /// Get all watched directories
     public var watchedDirectories: [URL] {
+        #if os(macOS)
+            fseventsLock.lock()
+            let isWatchingFSEvents = fseventsIsWatching
+            fseventsLock.unlock()
+            if isWatchingFSEvents {
+                return [rootURL]
+            }
+        #endif
+
         watchersLock.lock()
         defer { watchersLock.unlock() }
         return Array(watchers.keys)
     }
-    
+
     // MARK: - Filter Management
-    
+
     /// Add a filter to all watchers
     /// - Parameter filter: The filter to add
     public func addFilter(_ filter: FileFilter) {
         watchersLock.lock()
         defer { watchersLock.unlock() }
-        
+
         for (_, watcher) in watchers {
             watcher.addFilter(filter)
         }
-        
+
         // Update configuration for future watchers
         configuration.filterChain.add(filter)
     }
-    
+
     /// Clear all filters
     public func clearFilters() {
         watchersLock.lock()
         defer { watchersLock.unlock() }
-        
+
         for (_, watcher) in watchers {
             watcher.clearFilters()
         }
-        
+
         configuration.filterChain.clear()
     }
-    
+
     // MARK: - Ignore List Management
-    
+
     /// Add files to the ignore list
     /// - Parameter urls: The URLs to ignore
     public func addIgnoredFiles(_ urls: [URL]) {
         configuration.ignoreList.addIgnored(urls)
     }
-    
+
     /// Add files for predictive ignoring
     /// - Parameter urls: The URLs to predictively ignore
     public func addPredictiveIgnore(_ urls: [URL]) {
         configuration.ignoreList.addPredictiveIgnore(urls)
     }
-    
+
     // MARK: - Combine Support
-    
+
     /// Publisher for directory change events
     public var directoryChangePublisher: AnyPublisher<URL, Never> {
         directoryChangeSubject.eraseToAnyPublisher()
     }
-    
+
     /// Publisher for filtered change events
     public var filteredChangePublisher: AnyPublisher<[URL], Never> {
         filteredChangeSubject.eraseToAnyPublisher()
     }
-    
+
     // MARK: - Swift Concurrency Support
-    
+
     /// Async stream of directory changes
     public var directoryChanges: AsyncStream<URL> {
         AsyncStream { continuation in
             let id = UUID()
-            
+
             continuationLock.lock()
             continuations[id] = continuation
             continuationLock.unlock()
-            
+
             continuation.onTermination = { [weak self] _ in
                 self?.continuationLock.lock()
                 self?.continuations.removeValue(forKey: id)
@@ -266,16 +396,16 @@ public class RecursiveDirectoryWatcher {
             }
         }
     }
-    
+
     /// Async stream of filtered changes
     public var filteredChanges: AsyncStream<[URL]> {
         AsyncStream { continuation in
             let id = UUID()
-            
+
             continuationLock.lock()
             filteredContinuations[id] = continuation
             continuationLock.unlock()
-            
+
             continuation.onTermination = { [weak self] _ in
                 self?.continuationLock.lock()
                 self?.filteredContinuations.removeValue(forKey: id)
@@ -283,9 +413,9 @@ public class RecursiveDirectoryWatcher {
             }
         }
     }
-    
+
     // MARK: - Private Methods
-    
+
     /// Iterative recursive scan. Uses an explicit stack instead of true
     /// recursion so deep trees cannot blow the call stack, and so that hitting
     /// the `maxWatchedDirectories` ceiling can short-circuit cleanly.
@@ -331,7 +461,8 @@ public class RecursiveDirectoryWatcher {
 
                     // Check if it's a symbolic link
                     if let resourceValues = try? item.resourceValues(forKeys: [.isSymbolicLinkKey]),
-                       let isSymbolicLink = resourceValues.isSymbolicLink {
+                        let isSymbolicLink = resourceValues.isSymbolicLink
+                    {
                         isSymlink = isSymbolicLink
                     }
 
@@ -342,7 +473,8 @@ public class RecursiveDirectoryWatcher {
 
                     // Check if it's a directory
                     if FileManager.default.fileExists(atPath: item.path, isDirectory: &isDirectory),
-                       isDirectory.boolValue {
+                        isDirectory.boolValue
+                    {
                         stack.append((item, depth + 1))
                     }
                 }
@@ -427,16 +559,16 @@ public class RecursiveDirectoryWatcher {
             return .failed
         }
     }
-    
+
     private func checkForNewSubdirectories(in directory: URL) {
         // Get current depth of this directory
         let depth = calculateDepth(for: directory)
-        
+
         // Check if we should continue watching deeper
         if let maxDepth = options.maxDepth, depth >= maxDepth {
             return
         }
-        
+
         // Scan for new subdirectories
         do {
             let contents = try FileManager.default.contentsOfDirectory(
@@ -444,17 +576,18 @@ public class RecursiveDirectoryWatcher {
                 includingPropertiesForKeys: [.isDirectoryKey],
                 options: [.skipsHiddenFiles]
             )
-            
+
             for item in contents {
                 var isDirectory: ObjCBool = false
                 if FileManager.default.fileExists(atPath: item.path, isDirectory: &isDirectory),
-                   isDirectory.boolValue {
-                    
+                    isDirectory.boolValue
+                {
+
                     // Check if we're already watching this directory
                     watchersLock.lock()
                     let isWatching = watchers[item] != nil
                     watchersLock.unlock()
-                    
+
                     if !isWatching {
                         // Start watching the new subdirectory
                         scanAndWatchSubdirectories(at: item, currentDepth: depth + 1)
@@ -465,54 +598,341 @@ public class RecursiveDirectoryWatcher {
             // Ignore errors
         }
     }
-    
+
     private func calculateDepth(for url: URL) -> Int {
         let rootComponents = rootURL.pathComponents
         let urlComponents = url.pathComponents
-        
+
         // Calculate the depth relative to root
         return max(0, urlComponents.count - rootComponents.count)
     }
-    
+
     private func matchesGlobPattern(name: String, pattern: String) -> Bool {
         // Simple glob pattern matching
-        var regexPattern = pattern
+        var regexPattern =
+            pattern
             .replacingOccurrences(of: ".", with: "\\.")
             .replacingOccurrences(of: "*", with: ".*")
             .replacingOccurrences(of: "?", with: ".")
-        
+
         // Anchor the pattern
         regexPattern = "^" + regexPattern + "$"
-        
+
         return name.range(of: regexPattern, options: .regularExpression) != nil
     }
-    
+
+    #if os(macOS)
+        private func startFSEvents() {
+            if options.followSymlinks {
+                onError?(
+                    .invalidConfiguration(
+                        "FSEvents backend does not follow symlinked directories; use .automatic or .dispatchSource when followSymlinks is true."
+                    ))
+            }
+
+            fseventsLock.lock()
+            guard eventStream == nil else {
+                fseventsLock.unlock()
+                return
+            }
+            fseventsLock.unlock()
+
+            var context = FSEventStreamContext(
+                version: 0,
+                info: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()),
+                retain: nil,
+                release: nil,
+                copyDescription: nil
+            )
+
+            let flags =
+                FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents)
+                | FSEventStreamCreateFlags(kFSEventStreamCreateFlagNoDefer)
+                | FSEventStreamCreateFlags(kFSEventStreamCreateFlagUseCFTypes)
+                | FSEventStreamCreateFlags(kFSEventStreamCreateFlagWatchRoot)
+            let latency = max(0.05, min(configuration.debounceInterval, 1.0))
+
+            guard
+                let stream = FSEventStreamCreate(
+                    kCFAllocatorDefault,
+                    Self.fseventsCallback,
+                    &context,
+                    [rootURL.standardizedFileURL.path] as CFArray,
+                    FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+                    latency,
+                    flags
+                )
+            else {
+                onError?(.systemResourcesUnavailable)
+                return
+            }
+
+            FSEventStreamSetDispatchQueue(stream, configuration.queue)
+            guard FSEventStreamStart(stream) else {
+                FSEventStreamInvalidate(stream)
+                FSEventStreamRelease(stream)
+                onError?(.failedToWatch(rootURL, underlying: FSWatcherError.systemResourcesUnavailable))
+                return
+            }
+
+            fseventsLock.lock()
+            eventStream = stream
+            fseventsIsWatching = true
+            fseventsLock.unlock()
+        }
+
+        private func stopFSEvents() {
+            fseventsPendingLock.lock()
+            fseventsDebounceWorkItem?.cancel()
+            fseventsDebounceWorkItem = nil
+            fseventsPendingDirectories.removeAll()
+            fseventsPendingLock.unlock()
+
+            fseventsLock.lock()
+            let stream = eventStream
+            eventStream = nil
+            fseventsIsWatching = false
+            fseventsLock.unlock()
+
+            guard let stream else { return }
+            FSEventStreamStop(stream)
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+        }
+
+        private static let fseventsCallback: FSEventStreamCallback = { _, info, count, paths, flags, _ in
+            guard let info else { return }
+            let watcher = Unmanaged<RecursiveDirectoryWatcher>
+                .fromOpaque(info)
+                .takeUnretainedValue()
+            let eventPaths = unsafeBitCast(paths, to: NSArray.self) as? [String] ?? []
+            watcher.handleFSEvents(paths: eventPaths, flags: flags, count: count)
+        }
+
+        private func handleFSEvents(
+            paths: [String],
+            flags: UnsafePointer<FSEventStreamEventFlags>,
+            count: Int
+        ) {
+            var changedDirectories: Set<URL> = []
+
+            for index in 0..<min(paths.count, count) {
+                let eventFlags = flags[index]
+                guard shouldProcessFSEvent(eventFlags) else { continue }
+
+                let changedDirectory = directoryURL(forFSEventPath: paths[index], flags: eventFlags)
+                guard
+                    isWithinRoot(changedDirectory),
+                    isWithinDepth(changedDirectory),
+                    !isExcluded(changedDirectory)
+                else {
+                    continue
+                }
+                changedDirectories.insert(changedDirectory)
+            }
+
+            guard !changedDirectories.isEmpty else { return }
+            enqueueFSEvents(changedDirectories)
+        }
+
+        private func shouldProcessFSEvent(_ flags: FSEventStreamEventFlags) -> Bool {
+            let ignoredFlags =
+                FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone)
+                | FSEventStreamEventFlags(kFSEventStreamEventFlagMount)
+                | FSEventStreamEventFlags(kFSEventStreamEventFlagUnmount)
+
+            return flags & ignoredFlags == 0
+        }
+
+        private func directoryURL(forFSEventPath path: String, flags: FSEventStreamEventFlags) -> URL {
+            if requiresFullRescan(flags) {
+                return rootURL.standardizedFileURL
+            }
+
+            let url = URL(fileURLWithPath: path).standardizedFileURL
+            if flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir) != 0 {
+                var isDirectory: ObjCBool = false
+                if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                    return url
+                }
+                return url.deletingLastPathComponent().standardizedFileURL
+            }
+
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                return url
+            }
+            return url.deletingLastPathComponent().standardizedFileURL
+        }
+
+        private func requiresFullRescan(_ flags: FSEventStreamEventFlags) -> Bool {
+            let rescanFlags =
+                FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
+                | FSEventStreamEventFlags(kFSEventStreamEventFlagUserDropped)
+                | FSEventStreamEventFlags(kFSEventStreamEventFlagKernelDropped)
+                | FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped)
+                | FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged)
+
+            return flags & rescanFlags != 0
+        }
+
+        private func isWithinRoot(_ url: URL) -> Bool {
+            let rootPath = canonicalPath(rootURL)
+            let path = canonicalPath(url)
+            return path == rootPath || path.hasPrefix(rootPath + "/")
+        }
+
+        private func isWithinDepth(_ url: URL) -> Bool {
+            guard let maxDepth = options.maxDepth else { return true }
+            return fseventsDepth(for: url) <= maxDepth
+        }
+
+        private func isExcluded(_ url: URL) -> Bool {
+            guard !options.excludePatterns.isEmpty else { return false }
+            let rootComponents = canonicalPath(rootURL).split(separator: "/")
+            let components = canonicalPath(url).split(separator: "/")
+            guard components.count >= rootComponents.count else { return false }
+
+            let relativeComponents = components.dropFirst(rootComponents.count)
+            for component in relativeComponents {
+                for pattern in options.excludePatterns
+                where matchesGlobPattern(name: String(component), pattern: pattern) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        private func fseventsDepth(for url: URL) -> Int {
+            let rootPath = canonicalPath(rootURL)
+            let path = canonicalPath(url)
+            guard path != rootPath else { return 0 }
+            let relativePath = path.dropFirst(rootPath.count).drop { $0 == "/" }
+            return relativePath.split(separator: "/").count
+        }
+
+        private func canonicalPath(_ url: URL) -> String {
+            url.resolvingSymlinksInPath().standardizedFileURL.path
+        }
+
+        private func enqueueFSEvents(_ directories: Set<URL>) {
+            fseventsPendingLock.lock()
+            fseventsPendingDirectories.formUnion(directories)
+            fseventsDebounceWorkItem?.cancel()
+
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.flushFSEvents()
+            }
+            fseventsDebounceWorkItem = workItem
+            fseventsPendingLock.unlock()
+
+            configuration.queue.asyncAfter(deadline: .now() + configuration.debounceInterval, execute: workItem)
+        }
+
+        private func flushFSEvents() {
+            fseventsPendingLock.lock()
+            let directories = fseventsPendingDirectories
+            fseventsPendingDirectories.removeAll()
+            fseventsDebounceWorkItem = nil
+            fseventsPendingLock.unlock()
+
+            for directory in directories.sorted(by: { $0.path < $1.path }) {
+                handleDirectoryChange(directory)
+                let filteredFiles = getFilteredFilesRecursively(in: directory)
+                if !filteredFiles.isEmpty {
+                    handleFilteredChange(filteredFiles)
+                }
+            }
+        }
+        private func getFilteredFilesRecursively(in directory: URL) -> [URL] {
+            let depth = fseventsDepth(for: directory)
+            let remainingDepth = options.maxDepth.map { max(0, $0 - depth) }
+            return getFilteredFiles(in: directory, maxDepth: remainingDepth, currentDepth: 0)
+        }
+
+        private func getFilteredFiles(in directory: URL, maxDepth: Int?, currentDepth: Int) -> [URL] {
+            do {
+                let contents = try FileManager.default.contentsOfDirectory(
+                    at: directory,
+                    includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
+                    options: [.skipsHiddenFiles]
+                )
+
+                var filteredFiles: [URL] = []
+                for fileURL in contents {
+                    var isDirectory: ObjCBool = false
+                    guard FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDirectory) else {
+                        continue
+                    }
+
+                    if isDirectory.boolValue {
+                        guard !isExcluded(fileURL) else { continue }
+                        if maxDepth == nil || currentDepth < (maxDepth ?? 0) {
+                            filteredFiles.append(
+                                contentsOf: getFilteredFiles(
+                                    in: fileURL, maxDepth: maxDepth, currentDepth: currentDepth + 1))
+                        }
+                        continue
+                    }
+
+                    if configuration.ignoreList.shouldIgnore(fileURL) {
+                        continue
+                    }
+
+                    if !configuration.filterChain.isEmpty && !configuration.filterChain.matches(fileURL) {
+                        continue
+                    }
+
+                    filteredFiles.append(fileURL)
+                }
+                return filteredFiles
+            } catch {
+                return []
+            }
+        }
+    #else
+        private func startFSEvents() {
+            onError?(.invalidConfiguration("FSEvents backend is only available on macOS."))
+        }
+
+        private func stopFSEvents() {}
+    #endif
+
     private func handleDirectoryChange(_ url: URL) {
         // Create event
         let event = FileSystemEvent(url: url, eventType: .modified)
-        
+
         // Notify delegate
         delegate?.directoryDidChange(with: event)
-        
+
         // Call closure
         onDirectoryChange?(url)
-        
+
         // Publish to Combine
         directoryChangeSubject.send(url)
-        
+
         // Send to async streams
         continuationLock.lock()
         continuations.values.forEach { $0.yield(url) }
         continuationLock.unlock()
     }
-    
+
     private func handleFilteredChange(_ urls: [URL]) {
+        if let predictor = configuration.transformPredictor {
+            for file in urls {
+                let predictedOutputs = predictor.predictOutputFiles(for: file)
+                if !predictedOutputs.isEmpty {
+                    configuration.ignoreList.addPredictiveIgnore(predictedOutputs)
+                }
+            }
+        }
+
         // Call closure
         onFilteredChange?(urls)
-        
+
         // Publish to Combine
         filteredChangeSubject.send(urls)
-        
+
         // Send to async streams
         continuationLock.lock()
         filteredContinuations.values.forEach { $0.yield(urls) }

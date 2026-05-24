@@ -6,6 +6,7 @@
 //
 
 import XCTest
+
 @testable import FSWatcher
 
 final class RecursiveDirectoryWatcherTests: XCTestCase {
@@ -138,6 +139,237 @@ final class RecursiveDirectoryWatcherTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(watcher.watchedDirectories.count, 341)
     }
 
+    #if os(macOS)
+        // MARK: - FSEvents backend
+
+        func testFSEventsBackendBypassesDispatchSourceDirectoryCeiling() throws {
+            for index in 0..<20 {
+                let subdir = rootDir.appendingPathComponent("sub_\(index)")
+                try FileManager.default.createDirectory(at: subdir, withIntermediateDirectories: true)
+            }
+
+            let options = RecursiveWatchOptions(maxDepth: 1, maxWatchedDirectories: 1, backend: .fsevents)
+            let watcher = try RecursiveDirectoryWatcher(
+                url: rootDir,
+                options: options,
+                configuration: fastConfiguration()
+            )
+
+            let errorsLock = NSLock()
+            var limitErrors: [Int] = []
+            watcher.onError = { error in
+                if case .tooManyWatchers(let limit) = error {
+                    errorsLock.lock()
+                    limitErrors.append(limit)
+                    errorsLock.unlock()
+                }
+            }
+
+            let changedFile =
+                rootDir
+                .appendingPathComponent("sub_19")
+                .appendingPathComponent("photo.jpg")
+            let changeDetected = expectation(description: "FSEvents detects directory past DispatchSource ceiling")
+            fulfillOnce(changeDetected) { fulfill in
+                watcher.onDirectoryChange = { url in
+                    if Self.sameFile(url, changedFile.deletingLastPathComponent()) {
+                        fulfill()
+                    }
+                }
+            }
+
+            watcher.start()
+            defer { watcher.stop() }
+
+            XCTAssertTrue(watcher.isWatching)
+            XCTAssertEqual(watcher.watchedDirectories, [rootDir])
+
+            try writeJPEGStub(to: changedFile)
+            wait(for: [changeDetected], timeout: 5.0)
+
+            errorsLock.lock()
+            XCTAssertTrue(limitErrors.isEmpty)
+            errorsLock.unlock()
+        }
+
+        func testAutomaticBackendUsesFSEventsOnMacOSWhenSymlinksAreDisabled() throws {
+            let subdir = rootDir.appendingPathComponent("sub")
+            try FileManager.default.createDirectory(at: subdir, withIntermediateDirectories: true)
+
+            let options = RecursiveWatchOptions(maxDepth: 1, maxWatchedDirectories: 1, backend: .automatic)
+            let watcher = try RecursiveDirectoryWatcher(
+                url: rootDir,
+                options: options,
+                configuration: fastConfiguration()
+            )
+
+            watcher.start()
+            defer { watcher.stop() }
+
+            XCTAssertTrue(watcher.isWatching)
+            XCTAssertEqual(watcher.watchedDirectories, [rootDir])
+        }
+
+        func testAutomaticBackendFallsBackToDispatchSourceWhenFollowingSymlinks() throws {
+            let subdir = rootDir.appendingPathComponent("sub")
+            try FileManager.default.createDirectory(at: subdir, withIntermediateDirectories: true)
+
+            let options = RecursiveWatchOptions(
+                maxDepth: 1,
+                followSymlinks: true,
+                maxWatchedDirectories: 8,
+                backend: .automatic
+            )
+            let watcher = try RecursiveDirectoryWatcher(url: rootDir, options: options)
+
+            watcher.start()
+            defer { watcher.stop() }
+
+            XCTAssertTrue(watcher.isWatching)
+            XCTAssertGreaterThanOrEqual(watcher.watchedDirectories.count, 2)
+        }
+
+        func testFSEventsBackendDetectsFilteredFileInDeepDirectory() throws {
+            let deepDir =
+                rootDir
+                .appendingPathComponent("level1")
+                .appendingPathComponent("level2")
+            try FileManager.default.createDirectory(at: deepDir, withIntermediateDirectories: true)
+
+            let imageURL = deepDir.appendingPathComponent("photo.jpg")
+            let options = RecursiveWatchOptions(maxDepth: 2, backend: .fsevents)
+            let watcher = try RecursiveDirectoryWatcher(
+                url: rootDir,
+                options: options,
+                configuration: fastConfiguration(filter: .fileExtensions(["jpg"]))
+            )
+
+            let filteredDetected = expectation(description: "FSEvents emits filtered deep image")
+            fulfillOnce(filteredDetected) { fulfill in
+                watcher.onFilteredChange = { urls in
+                    if urls.contains(where: { Self.sameFile($0, imageURL) }) {
+                        fulfill()
+                    }
+                }
+            }
+
+            watcher.start()
+            defer { watcher.stop() }
+
+            try writeJPEGStub(to: imageURL)
+            wait(for: [filteredDetected], timeout: 5.0)
+        }
+
+        func testFSEventsBackendRespectsMaxDepth() throws {
+            let deepDir =
+                rootDir
+                .appendingPathComponent("level1")
+                .appendingPathComponent("level2")
+            try FileManager.default.createDirectory(at: deepDir, withIntermediateDirectories: true)
+
+            let imageURL = deepDir.appendingPathComponent("too-deep.jpg")
+            let options = RecursiveWatchOptions(maxDepth: 1, backend: .fsevents)
+            let watcher = try RecursiveDirectoryWatcher(
+                url: rootDir,
+                options: options,
+                configuration: fastConfiguration(filter: .fileExtensions(["jpg"]))
+            )
+
+            let filteredDetected = expectation(description: "too-deep image should not be emitted")
+            filteredDetected.isInverted = true
+            watcher.onFilteredChange = { urls in
+                if urls.contains(where: { Self.sameFile($0, imageURL) }) {
+                    filteredDetected.fulfill()
+                }
+            }
+
+            watcher.start()
+            defer { watcher.stop() }
+
+            try writeJPEGStub(to: imageURL)
+            wait(for: [filteredDetected], timeout: 1.5)
+        }
+
+        func testFSEventsBackendRespectsExcludePatterns() throws {
+            let skippedDir = rootDir.appendingPathComponent("skip")
+            let keptDir = rootDir.appendingPathComponent("keep")
+            try FileManager.default.createDirectory(at: skippedDir, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: keptDir, withIntermediateDirectories: true)
+
+            let skippedImage = skippedDir.appendingPathComponent("ignored.jpg")
+            let keptImage = keptDir.appendingPathComponent("accepted.jpg")
+            let options = RecursiveWatchOptions(
+                maxDepth: 1,
+                excludePatterns: ["skip"],
+                backend: .fsevents
+            )
+            let watcher = try RecursiveDirectoryWatcher(
+                url: rootDir,
+                options: options,
+                configuration: fastConfiguration(filter: .fileExtensions(["jpg"]))
+            )
+
+            let skippedDetected = expectation(description: "excluded image should not be emitted")
+            skippedDetected.isInverted = true
+            let keptDetected = expectation(description: "non-excluded image should be emitted")
+            fulfillOnce(keptDetected) { fulfill in
+                watcher.onFilteredChange = { urls in
+                    if urls.contains(where: { Self.sameFile($0, skippedImage) }) {
+                        skippedDetected.fulfill()
+                    }
+                    if urls.contains(where: { Self.sameFile($0, keptImage) }) {
+                        fulfill()
+                    }
+                }
+            }
+
+            watcher.start()
+            defer { watcher.stop() }
+
+            try writeJPEGStub(to: skippedImage)
+            try writeJPEGStub(to: keptImage)
+            wait(for: [skippedDetected, keptDetected], timeout: 5.0)
+        }
+
+        func testFSEventsBackendDetectsRenameIntoWatchedTree() throws {
+            let targetDir = rootDir.appendingPathComponent("drop")
+            try FileManager.default.createDirectory(at: targetDir, withIntermediateDirectories: true)
+
+            let outsideDir =
+                rootDir
+                .deletingLastPathComponent()
+                .appendingPathComponent("Outside_\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: outsideDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: outsideDir) }
+
+            let sourceURL = outsideDir.appendingPathComponent("move-in.jpg")
+            let targetURL = targetDir.appendingPathComponent("move-in.jpg")
+            try writeJPEGStub(to: sourceURL)
+
+            let options = RecursiveWatchOptions(maxDepth: 1, backend: .fsevents)
+            let watcher = try RecursiveDirectoryWatcher(
+                url: rootDir,
+                options: options,
+                configuration: fastConfiguration(filter: .fileExtensions(["jpg"]))
+            )
+
+            let filteredDetected = expectation(description: "FSEvents detects moved-in image")
+            fulfillOnce(filteredDetected) { fulfill in
+                watcher.onFilteredChange = { urls in
+                    if urls.contains(where: { Self.sameFile($0, targetURL) }) {
+                        fulfill()
+                    }
+                }
+            }
+
+            watcher.start()
+            defer { watcher.stop() }
+
+            try FileManager.default.moveItem(at: sourceURL, to: targetURL)
+            wait(for: [filteredDetected], timeout: 5.0)
+        }
+    #endif
+
     // MARK: - Error description sanity
 
     func testFailedToWatchErrorDescription() {
@@ -161,6 +393,35 @@ final class RecursiveDirectoryWatcherTests: XCTestCase {
             let sub = parent.appendingPathComponent("d\(currentDepth)_\(i)")
             try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
             try buildTree(at: sub, depth: depth, breadth: breadth, currentDepth: currentDepth + 1)
+        }
+    }
+
+    private func fastConfiguration(filter: FileFilter? = nil) -> DirectoryWatcher.Configuration {
+        var configuration = DirectoryWatcher.Configuration()
+        configuration.debounceInterval = 0.1
+        if let filter {
+            configuration.filterChain.add(filter)
+        }
+        return configuration
+    }
+
+    private func writeJPEGStub(to url: URL) throws {
+        try Data([0xFF, 0xD8, 0xFF, 0xD9]).write(to: url)
+    }
+
+    private static func sameFile(_ lhs: URL, _ rhs: URL) -> Bool {
+        lhs.resolvingSymlinksInPath().standardizedFileURL == rhs.resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    private func fulfillOnce(_ expectation: XCTestExpectation, install: (@escaping () -> Void) -> Void) {
+        let lock = NSLock()
+        var didFulfill = false
+        install {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !didFulfill else { return }
+            didFulfill = true
+            expectation.fulfill()
         }
     }
 }

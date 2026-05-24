@@ -120,6 +120,7 @@ public class RecursiveDirectoryWatcher {
         private var fseventsIsWatching = false
         private let fseventsLock = NSLock()
         private var fseventsPendingDirectories: Set<URL> = []
+        private var fseventsPendingFileEvents: [URL: FileSystemEvent] = [:]
         private var fseventsDebounceWorkItem: DispatchWorkItem?
         private let fseventsPendingLock = NSLock()
     #endif
@@ -133,15 +134,18 @@ public class RecursiveDirectoryWatcher {
     public weak var delegate: DirectoryWatcherDelegate?
     public var onDirectoryChange: ((URL) -> Void)?
     public var onFilteredChange: (([URL]) -> Void)?
+    public var onFileChange: ((FileSystemEvent) -> Void)?
     public var onError: ((FSWatcherError) -> Void)?
 
     // Combine support
     private let directoryChangeSubject = PassthroughSubject<URL, Never>()
     private let filteredChangeSubject = PassthroughSubject<[URL], Never>()
+    private let fileChangeSubject = PassthroughSubject<FileSystemEvent, Never>()
 
     // Swift Concurrency support
     private var continuations: [UUID: AsyncStream<URL>.Continuation] = [:]
     private var filteredContinuations: [UUID: AsyncStream<[URL]>.Continuation] = [:]
+    private var fileContinuations: [UUID: AsyncStream<FileSystemEvent>.Continuation] = [:]
     private let continuationLock = NSLock()
 
     // MARK: - Initialization
@@ -289,6 +293,8 @@ public class RecursiveDirectoryWatcher {
         continuations.removeAll()
         filteredContinuations.values.forEach { $0.finish() }
         filteredContinuations.removeAll()
+        fileContinuations.values.forEach { $0.finish() }
+        fileContinuations.removeAll()
         continuationLock.unlock()
     }
 
@@ -378,6 +384,11 @@ public class RecursiveDirectoryWatcher {
         filteredChangeSubject.eraseToAnyPublisher()
     }
 
+    /// Publisher for file-level change events.
+    public var fileChangePublisher: AnyPublisher<FileSystemEvent, Never> {
+        fileChangeSubject.eraseToAnyPublisher()
+    }
+
     // MARK: - Swift Concurrency Support
 
     /// Async stream of directory changes
@@ -409,6 +420,23 @@ public class RecursiveDirectoryWatcher {
             continuation.onTermination = { [weak self] _ in
                 self?.continuationLock.lock()
                 self?.filteredContinuations.removeValue(forKey: id)
+                self?.continuationLock.unlock()
+            }
+        }
+    }
+
+    /// Async stream of file-level changes.
+    public var fileChanges: AsyncStream<FileSystemEvent> {
+        AsyncStream { continuation in
+            let id = UUID()
+
+            continuationLock.lock()
+            fileContinuations[id] = continuation
+            continuationLock.unlock()
+
+            continuation.onTermination = { [weak self] _ in
+                self?.continuationLock.lock()
+                self?.fileContinuations.removeValue(forKey: id)
                 self?.continuationLock.unlock()
             }
         }
@@ -686,6 +714,7 @@ public class RecursiveDirectoryWatcher {
             fseventsDebounceWorkItem?.cancel()
             fseventsDebounceWorkItem = nil
             fseventsPendingDirectories.removeAll()
+            fseventsPendingFileEvents.removeAll()
             fseventsPendingLock.unlock()
 
             fseventsLock.lock()
@@ -700,39 +729,52 @@ public class RecursiveDirectoryWatcher {
             FSEventStreamRelease(stream)
         }
 
-        private static let fseventsCallback: FSEventStreamCallback = { _, info, count, paths, flags, _ in
+        private static let fseventsCallback: FSEventStreamCallback = { _, info, count, paths, flags, eventIds in
             guard let info else { return }
             let watcher = Unmanaged<RecursiveDirectoryWatcher>
                 .fromOpaque(info)
                 .takeUnretainedValue()
             let eventPaths = unsafeBitCast(paths, to: NSArray.self) as? [String] ?? []
-            watcher.handleFSEvents(paths: eventPaths, flags: flags, count: count)
+            watcher.handleFSEvents(paths: eventPaths, flags: flags, eventIds: eventIds, count: count)
         }
 
         private func handleFSEvents(
             paths: [String],
             flags: UnsafePointer<FSEventStreamEventFlags>,
+            eventIds: UnsafePointer<FSEventStreamEventId>,
             count: Int
         ) {
             var changedDirectories: Set<URL> = []
+            var fileEvents: [FileSystemEvent] = []
 
             for index in 0..<min(paths.count, count) {
                 let eventFlags = flags[index]
                 guard shouldProcessFSEvent(eventFlags) else { continue }
 
-                let changedDirectory = directoryURL(forFSEventPath: paths[index], flags: eventFlags)
+                let event = fileSystemEvent(
+                    forFSEventPath: paths[index],
+                    flags: eventFlags,
+                    eventID: UInt64(eventIds[index])
+                )
+                let depthURL = event.itemKind == .file ? event.url.deletingLastPathComponent() : event.url
                 guard
-                    isWithinRoot(changedDirectory),
-                    isWithinDepth(changedDirectory),
-                    !isExcluded(changedDirectory)
+                    isWithinRoot(depthURL),
+                    isWithinDepth(depthURL),
+                    !isExcluded(event.url)
                 else {
                     continue
                 }
-                changedDirectories.insert(changedDirectory)
+
+                if event.itemKind == .file {
+                    fileEvents.append(event)
+                    changedDirectories.insert(event.url.deletingLastPathComponent().standardizedFileURL)
+                } else {
+                    changedDirectories.insert(directoryURL(for: event))
+                }
             }
 
-            guard !changedDirectories.isEmpty else { return }
-            enqueueFSEvents(changedDirectories)
+            guard !changedDirectories.isEmpty || !fileEvents.isEmpty else { return }
+            enqueueFSEvents(changedDirectories, fileEvents: fileEvents)
         }
 
         private func shouldProcessFSEvent(_ flags: FSEventStreamEventFlags) -> Bool {
@@ -763,6 +805,73 @@ public class RecursiveDirectoryWatcher {
                 return url
             }
             return url.deletingLastPathComponent().standardizedFileURL
+        }
+
+        private func directoryURL(for event: FileSystemEvent) -> URL {
+            if event.requiresRescan {
+                return rootURL.standardizedFileURL
+            }
+            if event.itemKind == .directory {
+                return event.url.standardizedFileURL
+            }
+            return event.url.deletingLastPathComponent().standardizedFileURL
+        }
+
+        private func fileSystemEvent(
+            forFSEventPath path: String,
+            flags: FSEventStreamEventFlags,
+            eventID: UInt64
+        ) -> FileSystemEvent {
+            let url = URL(fileURLWithPath: path).standardizedFileURL
+            let itemKind = itemKind(for: url, flags: flags)
+            return FileSystemEvent(
+                url: url,
+                eventType: eventType(for: flags),
+                itemKind: itemKind,
+                requiresRescan: requiresFullRescan(flags),
+                rawFlags: UInt32(flags),
+                eventID: eventID
+            )
+        }
+
+        private func itemKind(for url: URL, flags: FSEventStreamEventFlags) -> FileSystemEvent.ItemKind {
+            if flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsFile) != 0 {
+                return .file
+            }
+            if flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir) != 0 {
+                return .directory
+            }
+            if flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsSymlink) != 0 {
+                return .symbolicLink
+            }
+
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+                return .unknown
+            }
+            return isDirectory.boolValue ? .directory : .file
+        }
+
+        private func eventType(for flags: FSEventStreamEventFlags) -> FileSystemEvent.EventType {
+            if flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated) != 0 {
+                return .created
+            }
+            if flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRemoved) != 0 {
+                return .deleted
+            }
+            if flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed) != 0 {
+                return .renamed
+            }
+            let modifiedFlags =
+                FSEventStreamEventFlags(kFSEventStreamEventFlagItemModified)
+                | FSEventStreamEventFlags(kFSEventStreamEventFlagItemInodeMetaMod)
+                | FSEventStreamEventFlags(kFSEventStreamEventFlagItemFinderInfoMod)
+                | FSEventStreamEventFlags(kFSEventStreamEventFlagItemChangeOwner)
+                | FSEventStreamEventFlags(kFSEventStreamEventFlagItemXattrMod)
+            if flags & modifiedFlags != 0 {
+                return .modified
+            }
+            return .unknown
         }
 
         private func requiresFullRescan(_ flags: FSEventStreamEventFlags) -> Bool {
@@ -815,9 +924,12 @@ public class RecursiveDirectoryWatcher {
             url.resolvingSymlinksInPath().standardizedFileURL.path
         }
 
-        private func enqueueFSEvents(_ directories: Set<URL>) {
+        private func enqueueFSEvents(_ directories: Set<URL>, fileEvents: [FileSystemEvent]) {
             fseventsPendingLock.lock()
             fseventsPendingDirectories.formUnion(directories)
+            for event in fileEvents {
+                fseventsPendingFileEvents[event.url] = event
+            }
             fseventsDebounceWorkItem?.cancel()
 
             let workItem = DispatchWorkItem { [weak self] in
@@ -832,17 +944,82 @@ public class RecursiveDirectoryWatcher {
         private func flushFSEvents() {
             fseventsPendingLock.lock()
             let directories = fseventsPendingDirectories
+            let fileEvents = Array(fseventsPendingFileEvents.values)
             fseventsPendingDirectories.removeAll()
+            fseventsPendingFileEvents.removeAll()
             fseventsDebounceWorkItem = nil
             fseventsPendingLock.unlock()
 
-            for directory in directories.sorted(by: { $0.path < $1.path }) {
-                handleDirectoryChange(directory)
-                let filteredFiles = getFilteredFilesRecursively(in: directory)
-                if !filteredFiles.isEmpty {
-                    handleFilteredChange(filteredFiles)
+            let sortedFileEvents = fileEvents.sorted { $0.url.path < $1.url.path }
+            var filteredFiles: [URL] = []
+            for event in sortedFileEvents {
+                handleFileChange(event)
+                if shouldEmitFilteredFileEvent(event) {
+                    filteredFiles.append(event.url)
                 }
             }
+            if !filteredFiles.isEmpty {
+                handleFilteredChange(filteredFiles)
+            }
+
+            for directory in directories.sorted(by: { $0.path < $1.path }) {
+                handleDirectoryChange(directory)
+                if shouldScanDirectoryEvent(directory, fileEvents: sortedFileEvents) {
+                    let filteredFiles = getFilteredFilesRecursively(in: directory)
+                    if !filteredFiles.isEmpty {
+                        handleFilteredChange(filteredFiles)
+                    }
+                }
+            }
+        }
+
+        private func shouldEmitFilteredFileEvent(_ event: FileSystemEvent) -> Bool {
+            guard event.itemKind == .file else { return false }
+            guard event.eventType != .deleted else { return false }
+            guard FileManager.default.fileExists(atPath: event.url.path) else { return false }
+            guard !isHidden(event.url) else { return false }
+            if configuration.ignoreList.shouldIgnore(event.url) {
+                return false
+            }
+            if !configuration.filterChain.isEmpty && !configuration.filterChain.matches(event.url) {
+                return false
+            }
+            return true
+        }
+
+        private func shouldScanDirectoryEvent(_ directory: URL, fileEvents: [FileSystemEvent]) -> Bool {
+            guard configuration.scansChangedDirectoriesForFilteredEvents else {
+                return false
+            }
+            if fileEvents.contains(where: { $0.requiresRescan }) {
+                return true
+            }
+            if !fileEvents.isEmpty,
+                fileEvents.allSatisfy({
+                    $0.itemKind == .file && $0.url.deletingLastPathComponent().standardizedFileURL == directory
+                })
+            {
+                return false
+            }
+            if directory == rootURL.standardizedFileURL {
+                return true
+            }
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+                isDirectory.boolValue
+            else {
+                return false
+            }
+            return !fileEvents.contains { event in
+                event.itemKind == .file && event.url.deletingLastPathComponent().standardizedFileURL == directory
+            }
+        }
+
+        private func isHidden(_ url: URL) -> Bool {
+            if url.lastPathComponent.hasPrefix(".") {
+                return true
+            }
+            return (try? url.resourceValues(forKeys: [.isHiddenKey]).isHidden) ?? false
         }
         private func getFilteredFilesRecursively(in directory: URL) -> [URL] {
             let depth = fseventsDepth(for: directory)
@@ -900,7 +1077,7 @@ public class RecursiveDirectoryWatcher {
 
     private func handleDirectoryChange(_ url: URL) {
         // Create event
-        let event = FileSystemEvent(url: url, eventType: .modified)
+        let event = FileSystemEvent(url: url, eventType: .modified, itemKind: .directory)
 
         // Notify delegate
         delegate?.directoryDidChange(with: event)
@@ -914,6 +1091,18 @@ public class RecursiveDirectoryWatcher {
         // Send to async streams
         continuationLock.lock()
         continuations.values.forEach { $0.yield(url) }
+        continuationLock.unlock()
+    }
+
+    private func handleFileChange(_ event: FileSystemEvent) {
+        delegate?.fileDidChange(with: event)
+
+        onFileChange?(event)
+
+        fileChangeSubject.send(event)
+
+        continuationLock.lock()
+        fileContinuations.values.forEach { $0.yield(event) }
         continuationLock.unlock()
     }
 

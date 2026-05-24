@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.3.0
+
+### Added
+
+- File-level event API for recursive FSEvents watchers: `onFileChange`,
+  `fileChangePublisher`, `fileChanges`, and delegate `fileDidChange(with:)`.
+- `FileSystemEvent` metadata for item kind, raw flags, event ID, and rescan
+  hints.
+- `DirectoryWatcher.Configuration.scansChangedDirectoriesForFilteredEvents`
+  for workloads that want exact file events without directory snapshot scans.
+
+### Changed
+
+- FSEvents file events are emitted as exact file URLs before any filtered
+  directory snapshot fallback.
+- Filtered recursive events still preserve previous behavior by default, while
+  apps can now disable directory snapshots to keep very large trees event-only.
+
 ## v0.2.0
 
 ### Added

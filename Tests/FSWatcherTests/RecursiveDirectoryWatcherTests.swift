@@ -260,6 +260,77 @@ final class RecursiveDirectoryWatcherTests: XCTestCase {
             wait(for: [filteredDetected], timeout: 5.0)
         }
 
+        func testFSEventsBackendEmitsFileLevelEvent() throws {
+            let deepDir =
+                rootDir
+                .appendingPathComponent("level1")
+                .appendingPathComponent("level2")
+            try FileManager.default.createDirectory(at: deepDir, withIntermediateDirectories: true)
+
+            let imageURL = deepDir.appendingPathComponent("file-event.jpg")
+            let options = RecursiveWatchOptions(maxDepth: 2, backend: .fsevents)
+            let watcher = try RecursiveDirectoryWatcher(
+                url: rootDir,
+                options: options,
+                configuration: fastConfiguration(filter: .fileExtensions(["jpg"]))
+            )
+
+            let fileDetected = expectation(description: "FSEvents emits exact file event")
+            fulfillOnce(fileDetected) { fulfill in
+                watcher.onFileChange = { event in
+                    if Self.sameFile(event.url, imageURL) {
+                        XCTAssertEqual(event.itemKind, .file)
+                        XCTAssertTrue([.created, .modified, .renamed, .unknown].contains(event.eventType))
+                        XCTAssertFalse(event.requiresRescan)
+                        XCTAssertNotNil(event.eventID)
+                        fulfill()
+                    }
+                }
+            }
+
+            watcher.start()
+            defer { watcher.stop() }
+
+            try writeJPEGStub(to: imageURL)
+            wait(for: [fileDetected], timeout: 5.0)
+        }
+
+        func testFSEventsFileLevelEventRespectsMaxDepth() throws {
+            let allowedDir = rootDir.appendingPathComponent("level1")
+            let blockedDir = allowedDir.appendingPathComponent("level2")
+            try FileManager.default.createDirectory(at: blockedDir, withIntermediateDirectories: true)
+
+            let allowedURL = allowedDir.appendingPathComponent("allowed.jpg")
+            let blockedURL = blockedDir.appendingPathComponent("blocked.jpg")
+            let options = RecursiveWatchOptions(maxDepth: 1, backend: .fsevents)
+            let watcher = try RecursiveDirectoryWatcher(
+                url: rootDir,
+                options: options,
+                configuration: fastConfiguration(filter: .fileExtensions(["jpg"]))
+            )
+
+            let allowedDetected = expectation(description: "depth 1 file event emitted")
+            let blockedDetected = expectation(description: "depth 2 file event suppressed")
+            blockedDetected.isInverted = true
+            fulfillOnce(allowedDetected) { fulfill in
+                watcher.onFileChange = { event in
+                    if Self.sameFile(event.url, blockedURL) {
+                        blockedDetected.fulfill()
+                    }
+                    if Self.sameFile(event.url, allowedURL) {
+                        fulfill()
+                    }
+                }
+            }
+
+            watcher.start()
+            defer { watcher.stop() }
+
+            try writeJPEGStub(to: allowedURL)
+            try writeJPEGStub(to: blockedURL)
+            wait(for: [allowedDetected, blockedDetected], timeout: 5.0)
+        }
+
         func testFSEventsBackendRespectsMaxDepth() throws {
             let deepDir =
                 rootDir

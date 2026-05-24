@@ -39,7 +39,7 @@ Add FSWatcher to your project through Xcode or by adding it to your `Package.swi
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/okooo5km/FSWatcher.git", from: "0.2.0")
+    .package(url: "https://github.com/okooo5km/FSWatcher.git", from: "0.3.0")
 ]
 ```
 
@@ -119,8 +119,9 @@ let options = RecursiveWatchOptions(
 )
 
 let watcher = try RecursiveDirectoryWatcher(url: photosURL, options: options)
-watcher.onDirectoryChange = { changedDirectory in
-    print("Changed: \(changedDirectory.path)")
+watcher.onFileChange = { event in
+    guard event.itemKind == .file, event.eventType != .deleted else { return }
+    print("Changed file: \(event.url.path)")
 }
 watcher.start()
 ```
@@ -133,6 +134,23 @@ directories as independent recursive roots.
 
 When the FSEvents backend is active, `watchedDirectories` returns the watched
 root URL. `maxWatchedDirectories` only applies to the DispatchSource backend.
+
+If your app only needs exact file events, disable filtered directory snapshots
+to avoid listing large directories on directory-level events:
+
+```swift
+var configuration = DirectoryWatcher.Configuration()
+configuration.scansChangedDirectoriesForFilteredEvents = false
+
+let watcher = try RecursiveDirectoryWatcher(
+    url: photosURL,
+    options: options,
+    configuration: configuration
+)
+watcher.onFileChange = { event in
+    process(event.url)
+}
+```
 
 ### Stress Testing
 

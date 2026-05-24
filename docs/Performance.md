@@ -273,9 +273,28 @@ let watcher = try RecursiveDirectoryWatcher(url: directoryURL, options: options)
 watcher.start(on: .global(qos: .utility))
 ```
 
-FSEvents watches the root hierarchy with one stream. It coalesces events and the
-watcher performs a bounded snapshot under the changed directory so deep files are
-still surfaced through `onFilteredChange`.
+FSEvents watches the root hierarchy with one stream. Exact file changes are
+surfaced through `onFileChange`, `fileChangePublisher`, and `fileChanges`.
+For backward compatibility, the watcher can also perform a bounded snapshot
+under changed directories so deep files are surfaced through `onFilteredChange`.
+
+For large image libraries, sync folders, or any app that only needs the file
+that changed, disable directory snapshots and consume file-level events:
+
+```swift
+var configuration = DirectoryWatcher.Configuration()
+configuration.scansChangedDirectoriesForFilteredEvents = false
+
+let watcher = try RecursiveDirectoryWatcher(
+    url: directoryURL,
+    options: options,
+    configuration: configuration
+)
+watcher.onFileChange = { event in
+    guard event.itemKind == .file, event.eventType != .deleted else { return }
+    process(event.url)
+}
+```
 
 Use `.automatic` if you want the library to select FSEvents on macOS and
 DispatchSource elsewhere. `.automatic` falls back to DispatchSource when

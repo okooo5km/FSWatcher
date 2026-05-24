@@ -101,6 +101,24 @@ public func startAsync(on queue: DispatchQueue = .global(qos: .utility)) async
 public func stop()
 ```
 
+#### RecursiveDirectoryWatcher - Events
+
+```swift
+public weak var delegate: DirectoryWatcherDelegate?
+public var onDirectoryChange: ((URL) -> Void)?
+public var onFilteredChange: (([URL]) -> Void)?
+public var onFileChange: ((FileSystemEvent) -> Void)?
+public var onError: ((FSWatcherError) -> Void)?
+
+public var directoryChangePublisher: AnyPublisher<URL, Never> { get }
+public var filteredChangePublisher: AnyPublisher<[URL], Never> { get }
+public var fileChangePublisher: AnyPublisher<FileSystemEvent, Never> { get }
+
+public var directoryChanges: AsyncStream<URL> { get }
+public var filteredChanges: AsyncStream<[URL]> { get }
+public var fileChanges: AsyncStream<FileSystemEvent> { get }
+```
+
 #### RecursiveWatchOptions
 
 ```swift
@@ -134,6 +152,10 @@ DispatchSource.
 
 When FSEvents is active, `watchedDirectories` returns the watched root URL.
 `maxWatchedDirectories` applies only to the DispatchSource backend.
+
+File-level events are available through `onFileChange`,
+`fileChangePublisher`, and `fileChanges`. They report the exact URL, item kind,
+event type, raw flags, and event ID when the OS provides them.
 
 ### MultiRecursiveDirectoryWatcher
 
@@ -169,6 +191,9 @@ public func addPredictiveIgnore(_ urls: [URL], in directory: URL)
 public var watchedDirectories: [URL] { get }
 public var allWatchedDirectories: [URL] { get }
 public var isWatching: Bool { get }
+public var onFileChange: ((FileSystemEvent) -> Void)?
+public var fileChangePublisher: AnyPublisher<FileSystemEvent, Never> { get }
+public var fileChanges: AsyncStream<FileSystemEvent> { get }
 ```
 
 ## Configuration
@@ -183,8 +208,42 @@ public struct Configuration {
     public var filterChain: FilterChain = FilterChain()
     public var ignoreList: IgnoreList = IgnoreList()
     public var transformPredictor: FileTransformPredictor?
+    public var scansChangedDirectoriesForFilteredEvents: Bool = true
     
     public init()
+}
+```
+
+Set `scansChangedDirectoriesForFilteredEvents = false` when you consume exact
+file-level events and want to avoid directory listing work. Exact FSEvents file
+events are still emitted through `onFileChange`.
+
+### FileSystemEvent
+
+```swift
+public struct FileSystemEvent {
+    public enum ItemKind: Equatable, Sendable {
+        case file
+        case directory
+        case symbolicLink
+        case unknown
+    }
+
+    public enum EventType: Equatable, Sendable {
+        case created
+        case modified
+        case deleted
+        case renamed
+        case unknown
+    }
+
+    public let url: URL
+    public let eventType: EventType
+    public let timestamp: Date
+    public let itemKind: ItemKind
+    public let requiresRescan: Bool
+    public let rawFlags: UInt32
+    public let eventID: UInt64?
 }
 ```
 

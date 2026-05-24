@@ -139,6 +139,25 @@ assetWatcher.start(on: .global(qos: .utility))
 This backend uses one root FSEvent stream and does not consume one file
 descriptor per subdirectory. `watchedDirectories` returns the watched root URL.
 
+For event-driven automation on very large trees, consume exact file-level events
+and disable directory snapshots:
+
+```swift
+var configuration = DirectoryWatcher.Configuration()
+configuration.scansChangedDirectoriesForFilteredEvents = false
+
+let assetWatcher = try RecursiveDirectoryWatcher(
+    url: assetRoot,
+    options: options,
+    configuration: configuration
+)
+assetWatcher.onFileChange = { event in
+    guard event.itemKind == .file, event.eventType != .deleted else { return }
+    processChangedAsset(event.url)
+}
+assetWatcher.start()
+```
+
 ### Content Management System
 
 Monitor content directories with smart categorization:
